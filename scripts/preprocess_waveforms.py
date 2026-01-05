@@ -5,7 +5,8 @@ import h5py
 import os
 from tqdm import tqdm
 
-from hparams import DATA_ROOT
+# from hparams import DATA_ROOT
+DATA_ROOT = '/home/remote/Documents/datasets/lesaude/mimic-iv-ecg-diagnostic-electrocardiogram-matched-subset-1.0'
 
 # ================= CONFIGURATION =================
 CSV_FILE = 'record_list.csv'
@@ -64,7 +65,7 @@ def build_monolith_baseline():
         # Strodthoff baseline uses float32. 
         dset_waves = f.create_dataset('waveforms', 
                                       shape=(total_records, TARGET_LEN, CHANNELS), 
-                                      dtype='float32', 
+                                      dtype='float16', 
                                       chunks=(1, TARGET_LEN, CHANNELS)) 
         
         # 2. Subject ID (Integer for fast filtering)
