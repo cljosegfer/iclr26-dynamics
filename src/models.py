@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from xresnet1d import xresnet1d50  # baseline
+from src.xresnet1d import xresnet1d50  # baseline
 
 class MedicalLatentDynamics(nn.Module):
     def __init__(self, 
@@ -21,6 +21,24 @@ class MedicalLatentDynamics(nn.Module):
         # The backbone output is usually (Batch, 2048, Length).
         # We need to pool it to (Batch, 2048).
         self.pool = nn.AdaptiveAvgPool1d(1)
+
+        # --- AUTO-DETECT BACKBONE OUTPUT DIMENSION ---
+        # We run a dummy pass to find out what xresnet1d50 actually outputs
+        # (It varies between standard ResNet and the AI4HealthUOL variant)
+        with torch.no_grad():
+            dummy_input = torch.randn(2, num_input_channels, 1000)
+            features = self.encoder_backbone(dummy_input)
+            backbone_out_dim = features.shape[1] # e.g., 256 or 2048
+            
+        print(f"   > Detected Backbone Output Dim: {backbone_out_dim}")
+        
+        # Projection layer: Map Backbone Dim -> Desired Latent Dim
+        # If they match, this is just an Identity, but usually 256 -> 2048
+        self.backbone_projection = nn.Sequential(
+            nn.Linear(backbone_out_dim, latent_dim),
+            nn.BatchNorm1d(latent_dim),
+            nn.ReLU()
+        )
         
         # 2. ACTION PROJECTOR (Embeds the sparse difference vector)
         self.action_mlp = nn.Sequential(
@@ -57,10 +75,11 @@ class MedicalLatentDynamics(nn.Module):
         )
 
     def encode(self, x):
-        """Returns the representation z (used for downstream tasks)."""
-        feat = self.encoder_backbone(x) # (B, 2048, L)
-        z = self.pool(feat).flatten(1)  # (B, 2048)
-        return z
+        """Returns the representation h (used for downstream tasks)."""
+        feat = self.encoder_backbone(x)     # (B, 256, L)
+        raw_z = self.pool(feat).flatten(1)  # (B, 256)
+        h = self.backbone_projection(raw_z) # (B, 2048)
+        return h
 
     def forward(self, x_t, action):
         """
