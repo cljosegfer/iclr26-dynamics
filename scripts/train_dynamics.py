@@ -4,7 +4,7 @@ import argparse
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 import wandb
 import numpy as np
@@ -59,6 +59,8 @@ def train(args):
         shuffle=True, 
         num_workers=config.num_workers,
         pin_memory=True,
+        prefetch_factor=4,      # NEW: Each worker pre-loads 4 batches. Keeps the pipe full.
+        persistent_workers=True, # NEW: Don't kill workers after each epoch.
         drop_last=True
     )
     
@@ -67,7 +69,9 @@ def train(args):
         batch_size=config.batch_size, 
         shuffle=False, 
         num_workers=config.num_workers,
-        pin_memory=True
+        pin_memory=True,
+        prefetch_factor=4,      # NEW: Each worker pre-loads 4 batches. Keeps the pipe full.
+        persistent_workers=True, # NEW: Don't kill workers after each epoch.
     )
 
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
@@ -100,7 +104,7 @@ def train(args):
         cov_coeff=config.cov_coeff
     )
     
-    scaler = GradScaler() # For Mixed Precision
+    scaler = GradScaler('cuda') # For Mixed Precision
 
     # 5. Training Loop
     best_val_loss = float('inf')
@@ -119,7 +123,7 @@ def train(args):
             
             optimizer.zero_grad()
             
-            with autocast():
+            with autocast('cuda'):
                 # A. Forward Pass (Student/Predictor)
                 # Model predicts: what should z_{t+1} look like given x_t and action?
                 outputs = model(x_t, action)
@@ -202,7 +206,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     
     # Hyperparameters
-    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--epochs', type=int, default=20)
     parser.add_argument('--batch_size', type=int, default=64) # Adjust based on VRAM
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-5)

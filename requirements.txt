@@ -6,5 +6,4 @@ seaborn
 wfdb
 h5py
 scikit-learn
-torch
 wandb

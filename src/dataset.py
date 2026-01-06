@@ -26,7 +26,7 @@ class DynamicsDataset(Dataset):
         self.f_wave = None
         self.f_label = None
         
-        print(f"Initializing Dataset from {os.path.basename(waveform_h5_path)}...")
+        print(f"Initializing Dataset from {waveform_h5_path}...")
         
         # --- Pre-calculate Valid Indices ---
         # We need to know which indices 'i' have a valid 'i+1' (Same Patient)
@@ -81,9 +81,10 @@ class DynamicsDataset(Dataset):
                 self.valid_indices = np.arange(len(subj_wave))
 
     def _open_files(self):
-        """Opens HDF5 files if not already open (Multiprocessing safe)."""
         if self.f_wave is None:
-            self.f_wave = h5py.File(self.wave_path, 'r')
+            # rdcc_nbytes: Raw Data Chunk Cache size. 
+            # Default is 1MB. Increase to 4MB or 8MB to smooth out reads.
+            self.f_wave = h5py.File(self.wave_path, 'r', rdcc_nbytes=1024*1024*4)
         if self.f_label is None:
             self.f_label = h5py.File(self.label_path, 'r')
 
@@ -96,36 +97,34 @@ class DynamicsDataset(Dataset):
         # Map the dataset index (0..N) to the HDF5 index (which might skip patient boundaries)
         real_idx = self.valid_indices[idx]
         
-        # 1. Load Current State (t)
-        x_t = torch.from_numpy(self.f_wave['waveforms'][real_idx]) # Shape: (5000, 12)
-        y_t = torch.from_numpy(self.f_label['icd'][real_idx]).long() # Shape: (76,)
+        # # 1. Load Current State (t)
+        # x_t = torch.from_numpy(self.f_wave['waveforms'][real_idx]) # Shape: (5000, 12)
+        # y_t = torch.from_numpy(self.f_label['icd'][real_idx]).long() # Shape: (76,)
 
-        # subject_id_waveform = self.f_wave['subject_id'][real_idx]
-        # subject_id_label = self.f_label['subject_id'][real_idx]
-        # assert subject_id_waveform == subject_id_label, f"Subject ID {subject_id_waveform, subject_id_label} mismatch between waveform and label files, idx {idx} real_idx {real_idx}."
-        # study_id_waveform = self.f_wave['study_id'][real_idx]
-        # study_id_label = self.f_label['study_id'][real_idx]
-        # assert study_id_waveform == study_id_label, f"Study ID {study_id_waveform, study_id_label} mismatch between waveform and label files, idx {idx} real_idx {real_idx}."
-
-        # Transpose ECG for PyTorch Conv1d: (Time, Channels) -> (Channels, Time)
-        x_t = x_t.transpose(0, 1) 
+        # # Transpose ECG for PyTorch Conv1d: (Time, Channels) -> (Channels, Time)
+        # x_t = x_t.transpose(0, 1) 
         
-        if not self.return_pairs:
-            # Classification Mode: Just return x, y
-            return {'waveform': x_t, 'icd': y_t.float()}
+        # if not self.return_pairs:
+        #     # Classification Mode: Just return x, y
+        #     return {'waveform': x_t, 'icd': y_t.float()}
 
-        # 2. Load Future State (t+1)
-        # We are guaranteed that real_idx+1 is the same patient because of __init__ logic
-        x_next = torch.from_numpy(self.f_wave['waveforms'][real_idx + 1])
-        y_next = torch.from_numpy(self.f_label['icd'][real_idx + 1]).long()
+        # # 2. Load Future State (t+1)
+        # # We are guaranteed that real_idx+1 is the same patient because of __init__ logic
+        # x_next = torch.from_numpy(self.f_wave['waveforms'][real_idx + 1])
+        # y_next = torch.from_numpy(self.f_label['icd'][real_idx + 1]).long()
 
-        # subject_id_waveform = self.f_wave['subject_id'][real_idx + 1]
-        # subject_id_label = self.f_label['subject_id'][real_idx + 1]
-        # assert subject_id_waveform == subject_id_label, f"Subject ID {subject_id_waveform, subject_id_label} mismatch between waveform and label files next, idx {idx} real_idx +1 {real_idx + 1}."
-        # study_id_waveform = self.f_wave['study_id'][real_idx + 1]
-        # study_id_label = self.f_label['study_id'][real_idx + 1]
-        # assert study_id_waveform == study_id_label, f"Study ID {study_id_waveform, study_id_label} mismatch between waveform and label files next, idx {idx} real_idx +1 {real_idx + 1}."
+        # x_next = x_next.transpose(0, 1)
 
+        # 1. load pair
+        pair_data = self.f_wave['waveforms'][real_idx : real_idx + 2]
+        pair_labels = self.f_label['icd'][real_idx : real_idx + 2]
+
+        x_t = torch.from_numpy(pair_data[0])
+        x_next = torch.from_numpy(pair_data[1])
+        y_t = torch.from_numpy(pair_labels[0]).long()
+        y_next = torch.from_numpy(pair_labels[1]).long()
+
+        x_t = x_t.transpose(0, 1)
         x_next = x_next.transpose(0, 1)
 
         # # 3. Compute Delta T

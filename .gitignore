@@ -1,7 +1,9 @@
 draft.py
 draft.ipynb
 hparams.py
-scripts/wandb/*
+wandb/*
+*/wandb/*
+gorgonoid/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
