@@ -59,26 +59,14 @@ def train(args):
 
     # 1. Dataset (Classification Mode)
     print("Loading Dataset...")
-    full_dataset = DynamicsDataset(
-        waveform_h5_path=os.path.join(DATA_ROOT, 'mimic_iv_ecg_waveforms.h5'),
-        label_h5_path=os.path.join(DATA_ROOT, 'mimic_iv_ecg_icd.h5'),
-        return_pairs=False  # Crucial: Returns (x, y)
+    train_ds = DynamicsDataset(
+        split='train',
+        return_pairs=False
     )
-    
-    # 50% Subsampling (To match your pre-training conditions if you used subsampling)
-    # If your pre-training used 50% data, you should use 50% here for fairness.
-    # If you want to see the "Upper Bound", use 100%. 
-    # Let's assume fairness:
-    if args.subsample:
-        print(">>> Subsampling to 50% to match Pre-training conditions...")
-        rng = np.random.default_rng(42)
-        total = len(full_dataset.valid_indices)
-        keep = int(total * 0.5)
-        full_dataset.valid_indices = full_dataset.valid_indices[rng.choice(total, keep, replace=False)]
-
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_ds, val_ds = random_split(full_dataset, [train_size, val_size])
+    val_ds = DynamicsDataset(
+        split='val',
+        return_pairs=False
+    )
     
     train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, 
                               num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4)
@@ -168,7 +156,6 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--subsample', action='store_true', help="Use 50% data like pretrain")
     
     args = parser.parse_args()
     train(args)

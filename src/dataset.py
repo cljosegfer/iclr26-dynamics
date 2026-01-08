@@ -4,6 +4,7 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 import os
+import pandas as pd
 
 from hparams import DATA_ROOT
 
@@ -11,11 +12,15 @@ class DynamicsDataset(Dataset):
     def __init__(self, 
                  waveform_h5_path = os.path.join(DATA_ROOT, 'mimic_iv_ecg_waveforms.h5'),
                  label_h5_path = os.path.join(DATA_ROOT, 'mimic_iv_ecg_icd.h5'),
+                 metadata_csv_path=os.path.join(DATA_ROOT, 'metadata.csv'),
+                 split='train',
                  return_pairs=True,):
         """
         Args:
             waveform_h5_path (str): Path to mimic_iv_ecg_waveforms.h5
             label_h5_path (str): Path to mimic_iv_ecg_icd.h5
+            metadata_csv_path (str): Path to metadata.csv
+            split (str): 'train', 'val', or 'test'
             return_pairs (bool): If True, returns (x_t, x_t+1, a_t). If False, returns (x_t, y_t) for classification.
         """
         self.wave_path = waveform_h5_path
@@ -25,6 +30,28 @@ class DynamicsDataset(Dataset):
         # File handles (initialized lazily to support num_workers > 0)
         self.f_wave = None
         self.f_label = None
+
+        # folds
+        df = pd.read_csv(metadata_csv_path)
+
+        if split == 'train':
+            target_folds = list(range(0, 18)) # 0 to 17
+        elif split == 'val':
+            target_folds = [18]
+        elif split == 'test':
+            target_folds = [19]
+        elif split == 'all':
+            target_folds = list(range(0, 20))
+        else:
+            raise ValueError(f"Unknown split: {split}")
+        
+        df_subset = df[df['fold'].isin(target_folds)].copy()
+        if not return_pairs and split in ['val', 'test']:
+            print(f"   > Applying Baseline Filter: Keeping only first ECG per stay (ecg_no_within_stay == 0)")
+            original_len = len(df_subset)
+            df_subset = df_subset[df_subset['ecg_no_within_stay'] == 0]
+            print(f"   > Reduced {original_len} -> {len(df_subset)} records.")
+        self.indices = df_subset['h5_index'].values
         
         print(f"Initializing Dataset from {waveform_h5_path}...")
         
@@ -54,9 +81,15 @@ class DynamicsDataset(Dataset):
 
             # 3. Calculate Indices
             if self.return_pairs:
+                # Create a boolean mask of the whole dataset where mask[i] = True if i is in our split
+                split_mask = np.zeros(len(subj_wave), dtype=bool)
+                split_mask[self.indices] = True
+
                 # Logic: Index 'i' is valid IF subject[i] == subject[i+1]
                 same_patient_mask = (subj_wave[:-1] == subj_wave[1:])
-                self.valid_indices = np.where(same_patient_mask)[0]
+                in_split = (split_mask[:-1] & split_mask[1:])
+                valid_mask = same_patient_mask & in_split
+                self.valid_indices = np.where(valid_mask)[0]
                 
                 # Balancing Logic
                 print("   Scanning for action types...")
@@ -78,13 +111,15 @@ class DynamicsDataset(Dataset):
                 print(f"   > Changed Pairs: {len(self.changed_indices)}")
                 
             else:
-                self.valid_indices = np.arange(len(subj_wave))
+                # self.valid_indices = np.arange(len(subj_wave))
+                self.valid_indices = self.indices
 
     def _open_files(self):
         if self.f_wave is None:
             # rdcc_nbytes: Raw Data Chunk Cache size. 
             # Default is 1MB. Increase to 4MB or 8MB to smooth out reads.
             self.f_wave = h5py.File(self.wave_path, 'r', rdcc_nbytes=1024*1024*16)
+            # self.f_wave = h5py.File(self.wave_path, 'r')
         if self.f_label is None:
             self.f_label = h5py.File(self.label_path, 'r')
 
@@ -96,22 +131,6 @@ class DynamicsDataset(Dataset):
         
         # Map the dataset index (0..N) to the HDF5 index (which might skip patient boundaries)
         real_idx = self.valid_indices[idx]
-        
-        # # 1. Load Current State (t)
-        # x_t = torch.from_numpy(self.f_wave['waveforms'][real_idx]) # Shape: (5000, 12)
-        # y_t = torch.from_numpy(self.f_label['icd'][real_idx]).long() # Shape: (76,)
-
-        # # Transpose ECG for PyTorch Conv1d: (Time, Channels) -> (Channels, Time)
-        # x_t = x_t.transpose(0, 1) 
-        
-
-
-        # # 2. Load Future State (t+1)
-        # # We are guaranteed that real_idx+1 is the same patient because of __init__ logic
-        # x_next = torch.from_numpy(self.f_wave['waveforms'][real_idx + 1])
-        # y_next = torch.from_numpy(self.f_label['icd'][real_idx + 1]).long()
-
-        # x_next = x_next.transpose(0, 1)
 
         # 1. load pair
         pair_data = self.f_wave['waveforms'][real_idx : real_idx + 2]

@@ -36,18 +36,15 @@ def train(args):
 
     # 2. Data Setup
     print("Loading Dataset...")
-    full_dataset = DynamicsDataset(
-        waveform_h5_path=os.path.join(DATA_ROOT, 'mimic_iv_ecg_waveforms.h5'),
-        label_h5_path=os.path.join(DATA_ROOT, 'mimic_iv_ecg_icd.h5'),
+    train_ds = DynamicsDataset(
+        split='train',
         return_pairs=True
     )
     
-    # Split Train/Val (90/10)
-    # Note: A strict patient-wise split is better, but random_split is okay for a start 
-    # since dataset indices are already grouped by patient.
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_ds, val_ds = random_split(full_dataset, [train_size, val_size])
+    val_ds = DynamicsDataset(
+        split='val',
+        return_pairs=True # We keep pairs for Dynamics validation
+    )
     
     # Optional: Weighted Sampling for Train
     # If using WeightedRandomSampler, you need to extract weights from the subset
