@@ -56,7 +56,7 @@ class OnlineLinearHead(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-def save_checkpoint(model, probe, optimizer, scheduler, scaler, epoch, best_metric, path):
+def save_checkpoint(model, probe, optimizer, scheduler, scaler, epoch, best_loss, best_auroc, path):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -64,7 +64,8 @@ def save_checkpoint(model, probe, optimizer, scheduler, scaler, epoch, best_metr
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'scaler_state_dict': scaler.state_dict(),
-        'best_val_auc': best_metric
+        'best_val_loss': best_loss,
+        'best_val_auc': best_auroc,
     }, path)
 
 def train(args):
@@ -111,8 +112,42 @@ def train(args):
     scaler = GradScaler('cuda')
 
     # 4. Training Loop
-    best_val_auc = 0.0
-    
+    best_val_auc = 0.72 # for now
+    best_val_loss = float('inf')
+
+    if args.resume_from:
+        if os.path.isfile(args.resume_from):
+            print(f"Loading checkpoint '{args.resume_from}'")
+            checkpoint = torch.load(args.resume_from)
+            start_epoch = checkpoint['epoch'] + 1
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            # scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            # 5. Robust Scheduler Logic
+            total_epochs = config.epochs
+            steps_per_epoch = len(train_loader)
+            
+            # If resuming, we need to extend the total steps or handle the offset
+            # The clean way: Create a NEW OneCycleLR that accounts for the remaining epochs
+            remaining_epochs = total_epochs - start_epoch
+            
+            if remaining_epochs <= 0:
+                print("Training already finished!")
+                return
+            
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer, 
+                max_lr=config.lr, 
+                steps_per_epoch=steps_per_epoch, 
+                epochs=total_epochs, # Total epochs of the entire run
+                last_epoch=(start_epoch * steps_per_epoch) - 1 # Trick it to start at correct step
+            )
+
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            best_val_loss = checkpoint['best_val_auc'] # for now
+            print(f"Resumed from Epoch {start_epoch} (Best AUC: {best_val_loss:.4f})")
+        else:
+            print(f"No checkpoint found at '{args.resume_from}', starting from scratch.")
     for epoch in range(config.epochs):
         model.train()
         probe.train()
@@ -240,14 +275,16 @@ def train(args):
         # Save Best based on AUROC (This is what we care about mostly)
         if val_auc > best_val_auc:
             best_val_auc = val_auc
-            save_checkpoint(model, probe, optimizer, scheduler, scaler, epoch, avg_val_dyn, "checkpoints/best_model_online.pth")
+            save_checkpoint(model, probe, optimizer, scheduler, scaler, epoch, best_val_loss, best_val_auc, "checkpoints/dynamics_probe.pth")
             print(">>> Saved Best Model (based on Online Probe)")
         
+        if avg_val_dyn < best_val_loss:
+            best_val_loss = avg_val_dyn
+            save_checkpoint(model, probe, optimizer, scheduler, scaler, epoch, best_val_loss, best_val_auc, "checkpoints/dynamics_best.pth")
+            print(">>> Saved Best Model")
+
         # 1. Save Latest (For resuming)
-        save_checkpoint(model, probe, optimizer, scheduler, scaler, epoch, avg_val_dyn, "checkpoints/model_online_latest.pth")
-        
-        # 2. Save Epoch History (Optional, for safety)
-        save_checkpoint(model, probe, optimizer, scheduler, scaler, epoch, avg_val_dyn, f"checkpoints/model_online_epoch_{epoch+1}.pth")
+        save_checkpoint(model, probe, optimizer, scheduler, scaler, epoch, best_val_loss, best_val_auc, "checkpoints/dynamics_latest.pth")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -262,6 +299,8 @@ if __name__ == "__main__":
     parser.add_argument('--sim_coeff', type=float, default=25.0)
     parser.add_argument('--std_coeff', type=float, default=25.0)
     parser.add_argument('--cov_coeff', type=float, default=1.0)
+
+    parser.add_argument('--resume_from', type=str, default=None, help="Path to checkpoint to resume from")
     
     args = parser.parse_args()
     train(args)
