@@ -79,8 +79,17 @@ def train(args):
 
     # 1. Dataset
     print("Loading Dataset...")
-    train_ds = DynamicsDataset(split='train', return_pairs=False)
-    val_ds = DynamicsDataset(split='val', return_pairs=False)
+    train_ds = DynamicsDataset(
+        split='train',
+        return_pairs=False,
+        data_fraction=args.data_fraction,
+        in_memory=args.in_memory
+    )
+    val_ds = DynamicsDataset(
+        split='val',
+        return_pairs=False,
+        in_memory=args.in_memory
+    )
     
     train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, 
                               num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4)
@@ -171,6 +180,9 @@ def train(args):
         print(f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val AUROC: {val_auc:.4f}")
         wandb.log({"train/loss": avg_train_loss, "val/auc": val_auc, "epoch": epoch+1})
         
+        # 1. Save Latest (For resuming)
+        save_checkpoint(model, optimizer, scheduler, scaler, epoch, best_val_auc, "checkpoints/finetuned_latest.pth")
+
         # Save Best
         if val_auc > best_val_auc:
             best_val_auc = val_auc
@@ -185,6 +197,9 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=256) # Increased to 256
     parser.add_argument('--lr', type=float, default=1e-4) # Low LR for finetuning
     parser.add_argument('--run_id', type=str, default=None)
+    # dataset
+    parser.add_argument('--data_fraction', type=float, default=1.0)
+    parser.add_argument('--in_memory', action='store_true')
     
     args = parser.parse_args()
     train(args)

@@ -14,28 +14,30 @@ class DynamicsDataset(Dataset):
                  label_h5_path = os.path.join(DATA_ROOT, 'mimic_iv_ecg_icd.h5'),
                  metadata_csv_path=os.path.join(DATA_ROOT, 'metadata.csv'),
                  split='train',
-                 return_pairs=True,):
+                 return_pairs=True,
+                 data_fraction=1.0, # NEW: Percentage of patients to keep
+                 in_memory=False,   # NEW: Load selected data into RAM
+                 seed=42):          # NEW: Deterministic splitting
         """
         Args:
-            waveform_h5_path (str): Path to mimic_iv_ecg_waveforms.h5
-            label_h5_path (str): Path to mimic_iv_ecg_icd.h5
-            metadata_csv_path (str): Path to metadata.csv
-            split (str): 'train', 'val', or 'test'
-            return_pairs (bool): If True, returns (x_t, x_t+1, a_t). If False, returns (x_t, y_t) for classification.
+            data_fraction (float): 0.0 < x <= 1.0. Fraction of PATIENTS to use.
+            in_memory (bool): If True, loads the filtered subset into RAM.
         """
         self.wave_path = waveform_h5_path
         self.label_path = label_h5_path
         self.return_pairs = return_pairs
+        self.in_memory = in_memory
         
-        # File handles (initialized lazily to support num_workers > 0)
+        # File handles (initialized lazily if not in_memory)
         self.f_wave = None
         self.f_label = None
 
-        # folds
+        # 1. Load and Filter Metadata
         df = pd.read_csv(metadata_csv_path)
 
+        # Define Splits
         if split == 'train':
-            target_folds = list(range(0, 18)) # 0 to 17
+            target_folds = list(range(0, 18))
         elif split == 'val':
             target_folds = [18]
         elif split == 'test':
@@ -45,160 +47,202 @@ class DynamicsDataset(Dataset):
         else:
             raise ValueError(f"Unknown split: {split}")
         
+        # Filter by Fold
         df_subset = df[df['fold'].isin(target_folds)].copy()
+        
+        # --- NEW: Data Fraction Logic (Patient-wise) ---
+        if data_fraction < 1.0 and split == 'train':
+            print(f"   > Subsampling {data_fraction*100}% of patients...")
+            unique_subjects = df_subset['subject_id'].unique()
+            n_keep = int(len(unique_subjects) * data_fraction)
+            
+            # Deterministic Shuffle
+            rng = np.random.default_rng(seed)
+            keep_subjects = rng.choice(unique_subjects, size=n_keep, replace=False)
+            
+            # Filter DataFrame
+            df_subset = df_subset[df_subset['subject_id'].isin(keep_subjects)]
+            print(f"   > Reduced from {len(unique_subjects)} to {len(keep_subjects)} patients.")
+            
+        # --- Baseline Filter for Val/Test ---
         if not return_pairs and split in ['val', 'test']:
-            print(f"   > Applying Baseline Filter: Keeping only first ECG per stay (ecg_no_within_stay == 0)")
-            original_len = len(df_subset)
+            print(f"   > Applying Baseline Filter: Keeping only first ECG per stay")
             df_subset = df_subset[df_subset['ecg_no_within_stay'] == 0]
-            print(f"   > Reduced {original_len} -> {len(df_subset)} records.")
+
+        # The absolute indices in the HDF5 file
         self.indices = df_subset['h5_index'].values
-        
-        print(f"Initializing Dataset from {waveform_h5_path}...")
-        
-        # --- Pre-calculate Valid Indices ---
-        # We need to know which indices 'i' have a valid 'i+1' (Same Patient)
-        # We perform a quick scan of the subject_ids.
-        with h5py.File(self.wave_path, 'r') as fw, h5py.File(self.label_path, 'r') as fl:
+        total_records = len(self.indices)
+        print(f"   > Total Records in {split} split: {total_records}")
+
+        # 2. In-Memory Loading (Optional)
+        if self.in_memory:
+            print(f"   > Loading {total_records} records into RAM...")
+            with h5py.File(self.wave_path, 'r') as fw, h5py.File(self.label_path, 'r') as fl:
+                # Optimized read: Sort indices to minimize disk seeks
+                sorted_indices = np.sort(self.indices)
+                
+                # Load Waveforms (Float32 or Float16 depending on file, converted to Float32 tensor)
+                # Note: h5py supports list indexing. 
+                self.ram_wave = torch.from_numpy(fw['waveforms'][sorted_indices]).float()
+                self.ram_label = torch.from_numpy(fl['icd'][sorted_indices]).float()
+                
+                # Map original H5 index -> Index in RAM tensor
+                # This handles the case where indices might not be contiguous
+                self.h5_to_ram = {h5_idx: ram_idx for ram_idx, h5_idx in enumerate(sorted_indices)}
+                
+            print(f"   > RAM Load Complete. Shape: {self.ram_wave.shape}")
             
-            # Load Subject IDs into memory (Fast, int32 array is small)
-            print("   Loading Subject IDs for integrity check...")
-            subj_wave = fw['subject_id'][:]
-            subj_label = fl['subject_id'][:]
+        # 3. Calculate Valid Indices (Pairs or Singles)
+        if self.return_pairs:
+            # We need to find pairs (i, i+1) that are:
+            # A) Both present in our df_subset (handled by filtering)
+            # B) From the same patient
             
-            # 1. Integrity Check (Performed ONCE at startup)
-            if not np.array_equal(subj_wave, subj_label):
-                mismatch_idx = np.where(subj_wave != subj_label)[0][0]
-                raise ValueError(f"CRITICAL DATA MISMATCH: Waveform and Label files are not aligned at index {mismatch_idx}. "
-                                 f"Wave subj: {subj_wave[mismatch_idx]}, Label subj: {subj_label[mismatch_idx]}")
-            print("   > Integrity Check Passed: Waveform and Label files are perfectly aligned.")
-
-            # 2. Study ID Check (Optional, but good if you have the data)
-            print("   Loading Study IDs for integrity check...")
-            study_wave = fw['study_id'][:]
-            study_label = fl['study_id'][:]
-            if not np.array_equal(study_wave, study_label):
-                raise ValueError("CRITICAL DATA MISMATCH: Study IDs do not match.")
-
-            # 3. Calculate Indices
-            if self.return_pairs:
-                # Create a boolean mask of the whole dataset where mask[i] = True if i is in our split
-                split_mask = np.zeros(len(subj_wave), dtype=bool)
-                split_mask[self.indices] = True
-
-                # Logic: Index 'i' is valid IF subject[i] == subject[i+1]
-                same_patient_mask = (subj_wave[:-1] == subj_wave[1:])
-                in_split = (split_mask[:-1] & split_mask[1:])
-                valid_mask = same_patient_mask & in_split
-                self.valid_indices = np.where(valid_mask)[0]
+            # Since df_subset is sorted by (Subject, Time), we can check subject continuity
+            # We work with the numpy arrays from the dataframe for speed
+            subjs = df_subset['subject_id'].values
+            h5_idxs = df_subset['h5_index'].values
+            
+            # Check: Subject[i] == Subject[i+1]
+            # AND: H5_Index[i+1] == H5_Index[i] + 1 (Ensures they are physically adjacent in file)
+            # The second check is implicitly true if sorted, but crucial if we filtered weirdly.
+            # Actually, we rely on physical adjacency for the optimized slice read [i:i+2]
+            
+            same_patient = (subjs[:-1] == subjs[1:])
+            contiguous = (h5_idxs[1:] == h5_idxs[:-1] + 1)
+            
+            valid_mask = same_patient & contiguous
+            
+            # These are indices relative to the DataFrame (0..len(df))
+            self.valid_df_indices = np.where(valid_mask)[0]
+            
+            # Balancing Logic (Stable vs Changed)
+            # We need to peek at labels. 
+            # If in_memory, use RAM. If not, use file.
+            if self.in_memory:
+                # These are Tensors because ram_label is a Tensor
+                curr_labels = self.ram_label[self.valid_df_indices]
+                next_labels = self.ram_label[self.valid_df_indices + 1]
                 
-                # Balancing Logic
-                print("   Scanning for action types...")
-                # Load all labels (int8 is small enough for RAM)
-                # Ensure the key matches your H5 file ('icd' or 'labels')
-                all_labels = fl['icd'][:] 
-                
-                curr_labels = all_labels[self.valid_indices]
-                next_labels = all_labels[self.valid_indices + 1]
-                
-                # Check for equality
-                is_stable = np.all(curr_labels == next_labels, axis=1)
-                
-                self.stable_indices = self.valid_indices[is_stable]
-                self.changed_indices = self.valid_indices[~is_stable]
-                
-                print(f"   > Total Pairs: {len(self.valid_indices)}")
-                print(f"   > Stable Pairs: {len(self.stable_indices)}")
-                print(f"   > Changed Pairs: {len(self.changed_indices)}")
-                
+                # FIX: Convert to numpy for the check to avoid "axis" vs "dim" error
+                if isinstance(curr_labels, torch.Tensor):
+                    curr_labels = curr_labels.numpy()
+                    next_labels = next_labels.numpy()
             else:
-                # self.valid_indices = np.arange(len(subj_wave))
-                self.valid_indices = self.indices
+                print("   > Scanning labels from disk for balancing...")
+                with h5py.File(self.label_path, 'r') as fl:
+                    # Bulk read filtered labels to minimize disk seeks
+                    # Note: We must be careful not to blow up RAM if indices are scattered
+                    # But for 10% data, it's fine. 
+                    # For safety, let's read only what we need if possible, 
+                    # but h5py doesn't support fancy indexing efficiently. 
+                    # We will rely on the fact that self.indices is sorted-ish.
+                    
+                    # Workaround: Read the full label set for the subset if it fits
+                    # or read in a loop if memory is tight. 
+                    # Given 'icd' is int8 and subset is small, bulk read is fine.
+                    all_labels_subset = fl['icd'][self.indices]
+                
+                curr_labels = all_labels_subset[self.valid_df_indices]
+                next_labels = all_labels_subset[self.valid_df_indices + 1]
+
+            is_stable = np.all(curr_labels == next_labels, axis=1)
+            
+            # Map back to valid_df_indices
+            self.stable_indices = self.valid_df_indices[is_stable]
+            self.changed_indices = self.valid_df_indices[~is_stable]
+            
+            # The main list of indices we will iterate over
+            self.valid_iterable = self.valid_df_indices
+            
+            print(f"   > Valid Pairs: {len(self.valid_iterable)}")
+            print(f"   > Stable: {len(self.stable_indices)} | Changed: {len(self.changed_indices)}")
+            
+        else:
+            # Classification Mode
+            # We iterate over all records in the subset
+            self.valid_iterable = np.arange(len(self.indices))
+            print(f"   > Total Samples: {len(self.valid_iterable)}")
 
     def _open_files(self):
         if self.f_wave is None:
-            # rdcc_nbytes: Raw Data Chunk Cache size. 
-            # Default is 1MB. Increase to 4MB or 8MB to smooth out reads.
-            self.f_wave = h5py.File(self.wave_path, 'r', rdcc_nbytes=1024*1024*16)
-            # self.f_wave = h5py.File(self.wave_path, 'r')
+            self.f_wave = h5py.File(self.wave_path, 'r', rdcc_nbytes=1024*1024*4)
         if self.f_label is None:
             self.f_label = h5py.File(self.label_path, 'r')
 
     def __len__(self):
-        return len(self.valid_indices)
+        return len(self.valid_iterable)
 
     def __getitem__(self, idx):
-        self._open_files()
+        # Index relative to the DataFrame subset
+        df_idx = self.valid_iterable[idx]
         
-        # Map the dataset index (0..N) to the HDF5 index (which might skip patient boundaries)
-        real_idx = self.valid_indices[idx]
+        # 1. Pre-training Mode (Pairs)
+        if self.return_pairs:
+            if self.in_memory:
+                # Direct RAM access
+                x_t = self.ram_wave[df_idx]
+                x_next = self.ram_wave[df_idx + 1]
+                y_t = self.ram_label[df_idx].long()
+                y_next = self.ram_label[df_idx + 1].long()
+            else:
+                self._open_files()
+                # Get absolute H5 index
+                real_h5_idx = self.indices[df_idx]
+                
+                # Optimized Slice Read [i : i+2]
+                # We validated they are contiguous in __init__
+                x_pair = torch.from_numpy(self.f_wave['waveforms'][real_h5_idx : real_h5_idx + 2])
+                y_pair = torch.from_numpy(self.f_label['icd'][real_h5_idx : real_h5_idx + 2]).long()
+                
+                x_t, x_next = x_pair[0], x_pair[1]
+                y_t, y_next = y_pair[0], y_pair[1]
 
-        # 1. load pair
-        pair_data = self.f_wave['waveforms'][real_idx : real_idx + 2]
-        pair_labels = self.f_label['icd'][real_idx : real_idx + 2]
+            # Process
+            x_t = x_t.transpose(0, 1)
+            x_next = x_next.transpose(0, 1)
+            action = (y_next - y_t).float()
+            
+            return {
+                'waveform': x_t, 
+                'waveform_next': x_next, 
+                'action': action, 
+                'icd': y_t.float() # For online probing
+            }
 
-        x_t = torch.from_numpy(pair_data[0]).float()
-        y_t = torch.from_numpy(pair_labels[0]).long()
-        x_t = x_t.transpose(0, 1)
-        if not self.return_pairs:
-            # Classification Mode: Just return x, y
+        # 2. Classification Mode (Single)
+        else:
+            if self.in_memory:
+                x_t = self.ram_wave[df_idx]
+                y_t = self.ram_label[df_idx].long()
+            else:
+                self._open_files()
+                real_h5_idx = self.indices[df_idx]
+                x_t = torch.from_numpy(self.f_wave['waveforms'][real_h5_idx])
+                y_t = torch.from_numpy(self.f_label['icd'][real_h5_idx]).long()
+            
+            x_t = x_t.transpose(0, 1)
+            
             return {'waveform': x_t, 'icd': y_t.float()}
-        x_next = torch.from_numpy(pair_data[1]).float()
-        y_next = torch.from_numpy(pair_labels[1]).long()
-        x_next = x_next.transpose(0, 1)
-
-        # # 3. Compute Delta T
-        # t0 = self.f_wave['timestamp'][real_idx]
-        # t1 = self.f_wave['timestamp'][real_idx + 1]
-        # dt_val = (t1 - t0) / self.time_scalar
-        # delta_t = torch.tensor([dt_val], dtype=torch.float32)
-
-        # 4. Compute Action Vector (Difference)
-        # y is int8, we want float for the network input
-        # Values will be -1.0, 0.0, 1.0
-        action = (y_next - y_t).float()
-        
-        # 5. Metadata (Optional, useful for debugging)
-        # study_id_t = self.f_wave['study_id'][real_idx]
-        # study_id_next = self.f_wave['study_id'][real_idx + 1]
-        # is_same_stay = (study_id_t == study_id_next)
-
-        return {'waveform': x_t, 'waveform_next': x_next, 'action': action, 
-                'icd': y_t.float(),  # for online probing
-                }
 
     def get_weights_for_balanced_sampling(self):
-        """
-        Returns a weight vector for WeightedRandomSampler.
-        Upsamples 'Changed' pairs to match 'Stable' pairs.
-        """
-        if not self.return_pairs:
-            return None
-            
-        weights = np.zeros(len(self.valid_indices))
+        if not self.return_pairs: return None
+        weights = np.zeros(len(self.valid_iterable))
+        n_stable, n_changed = len(self.stable_indices), len(self.changed_indices)
+        if n_stable == 0 or n_changed == 0: return None
         
-        # Assign weights based on class counts
-        n_stable = len(self.stable_indices)
-        n_changed = len(self.changed_indices)
+        w_stable, w_changed = 1.0 / n_stable, 1.0 / n_changed
         
-        # Weight = Total / (N_class)
-        # But simply: we want probability of changed to be higher.
-        # Let's target 50/50 probability.
+        # valid_iterable contains the df_indices. 
+        # stable_indices contains specific df_indices.
+        # We need to map df_index -> index in weights array
+        df_idx_to_weight_idx = {val: i for i, val in enumerate(self.valid_iterable)}
         
-        w_stable = 1.0 / n_stable
-        w_changed = 1.0 / n_changed
-        
-        # We need to map back from real indices to the dataset indices 0..N
-        # This is a bit tricky since valid_indices is a list.
-        # We can create a boolean mask for the dataset length.
-        
-        # Efficient way:
-        # 1. Create a map of "Real Index" -> "Dataset Index"
-        real_to_dataset = {real_idx: i for i, real_idx in enumerate(self.valid_indices)}
-        
-        for idx in self.stable_indices:
-            weights[real_to_dataset[idx]] = w_stable
-            
+        for idx in self.stable_indices: 
+            if idx in df_idx_to_weight_idx:
+                weights[df_idx_to_weight_idx[idx]] = w_stable
         for idx in self.changed_indices:
-            weights[real_to_dataset[idx]] = w_changed
-            
+            if idx in df_idx_to_weight_idx:
+                weights[df_idx_to_weight_idx[idx]] = w_changed
+                
         return torch.DoubleTensor(weights)

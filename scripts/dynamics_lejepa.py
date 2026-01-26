@@ -123,9 +123,18 @@ def train(args):
     
     # --- Data ---
     print("Loading Dataset...")
-    train_ds = DynamicsDataset(split='train', return_pairs=True)
-    val_ds = DynamicsDataset(split='val', return_pairs=True)
-    
+    train_ds = DynamicsDataset(
+        split='train', 
+        return_pairs=True,
+        data_fraction=args.data_fraction,
+        in_memory=args.in_memory
+        )
+    val_ds = DynamicsDataset(
+        split='val', 
+        return_pairs=True,
+        in_memory=args.in_memory
+        )
+
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, 
                               num_workers=8, pin_memory=True, prefetch_factor=4, persistent_workers=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, 
@@ -323,6 +332,9 @@ if __name__ == "__main__":
     parser.add_argument('--lamb', type=float, default=0.1) # Lambda trade-off
 
     parser.add_argument('--resume_from', type=str, default=None, help="Path to checkpoint to resume from")
+    # dataset
+    parser.add_argument('--data_fraction', type=float, default=1.0)
+    parser.add_argument('--in_memory', action='store_true')
     
     args = parser.parse_args()
     train(args)

@@ -52,11 +52,14 @@ def train(args):
     print("Loading Dataset...")
     train_ds = DynamicsDataset(
         split='train',
-        return_pairs=False
+        return_pairs=False,
+        data_fraction=args.data_fraction,
+        in_memory=args.in_memory
     )
     val_ds = DynamicsDataset(
         split='val',
-        return_pairs=False
+        return_pairs=False,
+        in_memory=args.in_memory
     )
     
     train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, 
@@ -167,8 +170,8 @@ def train(args):
         # 1. Save Latest (For resuming)
         save_checkpoint(model, optimizer, scheduler, scaler, epoch, best_val_auc, "checkpoints/supervised_latest.pth")
         
-        # 2. Save Epoch History (Optional, for safety)
-        save_checkpoint(model, optimizer, scheduler, scaler, epoch, best_val_auc, f"checkpoints/supervised_epoch_{epoch+1}.pth")
+        # # 2. Save Epoch History (Optional, for safety)
+        # save_checkpoint(model, optimizer, scheduler, scaler, epoch, best_val_auc, f"checkpoints/supervised_epoch_{epoch+1}.pth")
         
         # 3. Save Best
         if val_auc > best_val_auc:
@@ -179,11 +182,14 @@ def train(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', type=int, default=20)
-    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--batch_size', type=int, default=512)
     parser.add_argument('--lr', type=float, default=1e-4)
     # Resume arguments
     parser.add_argument('--resume_from', type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument('--run_id', type=str, default=None, help="WandB Run ID to resume logging")
+    # dataset
+    parser.add_argument('--data_fraction', type=float, default=1.0)
+    parser.add_argument('--in_memory', action='store_true')
     
     args = parser.parse_args()
     train(args)
